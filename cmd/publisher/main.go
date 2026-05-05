@@ -12,10 +12,14 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -30,7 +34,10 @@ const sentAtHeader = "sent_at_ns"
 
 type runFlags struct {
 	profilePath string
+	producers   int
+	pprofAddr   string
 	count       int64
+	duration    time.Duration
 	rate        int
 	users       int64
 	report      time.Duration
@@ -39,11 +46,17 @@ type runFlags struct {
 func parseFlags() runFlags {
 	var f runFlags
 	flag.StringVar(&f.profilePath, "profile", "configs/baseline.yaml", "path to YAML tuning profile")
-	flag.Int64Var(&f.count, "count", 0, "stop after N messages (0 = run until interrupted)")
-	flag.IntVar(&f.rate, "rate", 0, "max messages per second (0 = unlimited)")
+	flag.IntVar(&f.producers, "producers", 1, "number of concurrent producer goroutines (share one kgo.Client)")
+	flag.Int64Var(&f.count, "count", 0, "stop after N messages across all producers (0 = no limit)")
+	flag.DurationVar(&f.duration, "duration", 0, "stop after this much wall-clock time (0 = no limit)")
+	flag.IntVar(&f.rate, "rate", 0, "global max messages per second across all producers (0 = unlimited)")
 	flag.Int64Var(&f.users, "users", 1_000_000, "size of the synthetic user space")
 	flag.DurationVar(&f.report, "report", time.Second, "interval between metric log lines")
+	flag.StringVar(&f.pprofAddr, "pprof", "", "if non-empty, serve net/http/pprof on this address (e.g. :6060)")
 	flag.Parse()
+	if f.producers < 1 {
+		f.producers = 1
+	}
 	return f
 }
 
@@ -59,6 +72,21 @@ func main() {
 func run(flags runFlags) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	if flags.pprofAddr != "" {
+		runtime.SetBlockProfileRate(1)
+		runtime.SetMutexProfileFraction(1)
+		go func() {
+			slog.Info("pprof", "addr", flags.pprofAddr)
+			if err := http.ListenAndServe(flags.pprofAddr, nil); err != nil {
+				slog.Warn("pprof server", "err", err)
+			}
+		}()
+	}
+	if flags.duration > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, flags.duration)
+		defer cancel()
+	}
 
 	profile, err := config.Load(flags.profilePath)
 	if err != nil {
@@ -81,6 +109,7 @@ func run(flags runFlags) error {
 		"acks", profile.Producer.Acks,
 		"compression", profile.Producer.Compression,
 		"linger", profile.Producer.Linger.String(),
+		"producers", flags.producers,
 	)
 
 	rec := metrics.New()
@@ -99,63 +128,94 @@ func run(flags runFlags) error {
 		}
 	}()
 
-	g := gen.NewGenerator(uint64(time.Now().UnixNano()), flags.users)
-
-	var ticker *time.Ticker
-	if flags.rate > 0 {
-		ticker = time.NewTicker(time.Second / time.Duration(flags.rate))
-		defer ticker.Stop()
-	}
-
 	produce := chooseProducer(cl, profile, rec)
 
-	var wg sync.WaitGroup
-	produced := int64(0)
-loop:
-	for {
-		if ctx.Err() != nil {
-			break
-		}
-		if flags.count > 0 && produced >= flags.count {
-			break
-		}
-		if ticker != nil {
-			select {
-			case <-ctx.Done():
-				break loop
-			case <-ticker.C:
-			}
-		}
+	var inflight sync.WaitGroup // tracks async produce callbacks
+	var produced atomic.Int64   // shared count across producer goroutines
 
-		n := g.Next()
-		key, val, err := n.Marshal()
-		if err != nil {
-			return err
+	// When --rate is set we spread it evenly across producers; the "+ N - 1"
+	// rounds up so the global rate is respected even with awkward divisions.
+	var perWorkerInterval time.Duration
+	if flags.rate > 0 {
+		perWorker := flags.rate / flags.producers
+		if perWorker < 1 {
+			perWorker = 1
 		}
-		hdr := []kgo.RecordHeader{{Key: sentAtHeader, Value: nanosToBytes(n.SentAt.UnixNano())}}
-		r := &kgo.Record{Topic: profile.Topic, Key: key, Value: val, Headers: hdr}
-
-		produce(ctx, r, &wg)
-		produced++
+		perWorkerInterval = time.Second / time.Duration(perWorker)
 	}
 
-	wg.Wait()
+	var workers sync.WaitGroup
+	for i := 0; i < flags.producers; i++ {
+		workers.Add(1)
+		// Each goroutine gets its own Generator so there is no shared rand state.
+		seed := uint64(time.Now().UnixNano()) ^ uint64(i+1)*0x9E3779B97F4A7C15
+		go func(workerID int, seed uint64) {
+			defer workers.Done()
+			g := gen.NewGenerator(seed, flags.users)
+			var ticker *time.Ticker
+			if perWorkerInterval > 0 {
+				ticker = time.NewTicker(perWorkerInterval)
+				defer ticker.Stop()
+			}
+			for {
+				if ctx.Err() != nil {
+					return
+				}
+				if flags.count > 0 && produced.Load() >= flags.count {
+					return
+				}
+				if ticker != nil {
+					select {
+					case <-ctx.Done():
+						return
+					case <-ticker.C:
+					}
+				}
+
+				n := g.Next()
+				key, val, err := n.Marshal()
+				if err != nil {
+					slog.Warn("marshal", "err", err, "worker", workerID)
+					continue
+				}
+				hdr := []kgo.RecordHeader{{Key: sentAtHeader, Value: nanosToBytes(n.SentAt.UnixNano())}}
+				r := &kgo.Record{Topic: profile.Topic, Key: key, Value: val, Headers: hdr}
+
+				produce(ctx, r, &inflight)
+				produced.Add(1)
+			}
+		}(i, seed)
+	}
+
+	workers.Wait()
+	inflight.Wait()
 	if err := cl.Flush(context.Background()); err != nil {
 		slog.Warn("flush", "err", err)
 	}
-	slog.Info("done", "summary", rep.Tick("publish.final"))
+	fmt.Print(rec.Summary("publisher"))
 	return nil
 }
 
 // chooseProducer returns either a synchronous (one round-trip per record) or
 // asynchronous (callback-driven, batching) produce function based on profile.
 func chooseProducer(cl *kgo.Client, p *config.Profile, rec *metrics.Recorder) func(context.Context, *kgo.Record, *sync.WaitGroup) {
+	// Log only the first few produce errors so a misconfigured cluster doesn't
+	// flood the log with millions of identical lines.
+	var logged atomic.Int32
+	const maxLogged = 5
+	report := func(err error) {
+		if logged.Load() < maxLogged && logged.Add(1) <= maxLogged {
+			slog.Warn("produce error", "err", err)
+		}
+	}
+
 	switch strings.ToLower(p.Producer.Mode) {
 	case "single":
 		return func(ctx context.Context, r *kgo.Record, _ *sync.WaitGroup) {
 			start := time.Now()
 			if err := cl.ProduceSync(ctx, r).FirstErr(); err != nil {
 				rec.Fail()
+				report(err)
 				return
 			}
 			rec.Observe(time.Since(start))
@@ -169,6 +229,7 @@ func chooseProducer(cl *kgo.Client, p *config.Profile, rec *metrics.Recorder) fu
 				defer wg.Done()
 				if err != nil {
 					rec.Fail()
+					report(err)
 					return
 				}
 				rec.Observe(time.Since(start))

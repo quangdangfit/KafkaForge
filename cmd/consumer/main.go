@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -94,21 +95,29 @@ func run(flags runFlags) error {
 		}
 	}()
 
-	flushEvery := profile.Consumer.SinkFlushPeriod
-	maxBatch := profile.Consumer.SinkBatchSize
-	buf := make([]sink.Record, 0, maxBatch)
-	flushTimer := time.NewTimer(flushEvery)
-	defer flushTimer.Stop()
+	// Discard sinks skip all per-record allocation: when we're not persisting,
+	// we don't need to materialise sink.Record structs at all.
+	_, discardOnly := out.(sink.Discard)
 
+	maxBatch := profile.Consumer.SinkBatchSize
+	flushEvery := profile.Consumer.SinkFlushPeriod
+	var sinkMu sync.Mutex
+	buf := make([]sink.Record, 0, maxBatch)
 	flush := func() {
+		sinkMu.Lock()
 		if len(buf) == 0 {
+			sinkMu.Unlock()
 			return
 		}
-		if err := out.Write(ctx, buf); err != nil {
+		batch := buf
+		buf = make([]sink.Record, 0, maxBatch)
+		sinkMu.Unlock()
+		if err := out.Write(ctx, batch); err != nil {
 			slog.Warn("sink write", "err", err)
 		}
-		buf = buf[:0]
 	}
+	flushTimer := time.NewTimer(flushEvery)
+	defer flushTimer.Stop()
 
 	for {
 		if ctx.Err() != nil {
@@ -126,35 +135,63 @@ func run(flags runFlags) error {
 		}
 
 		now := time.Now().UTC()
-		fetches.EachRecord(func(r *kgo.Record) {
-			sentAt := readSentAt(r)
-			latency := time.Duration(0)
-			if !sentAt.IsZero() {
-				latency = now.Sub(sentAt)
+		var pwg sync.WaitGroup
+		fetches.EachPartition(func(p kgo.FetchTopicPartition) {
+			if len(p.Records) == 0 {
+				return
 			}
-			rec.Inc(len(r.Key) + len(r.Value))
-			rec.Observe(latency)
-			buf = append(buf, sink.Record{
-				Key: r.Key, Value: r.Value,
-				Topic: r.Topic, Partition: r.Partition, Offset: r.Offset,
-				SentAt: sentAt, RecvAt: now, Latency: latency,
-			})
-			if len(buf) >= maxBatch {
-				flush()
-			}
+			pwg.Add(1)
+			go func(p kgo.FetchTopicPartition) {
+				defer pwg.Done()
+				var local []sink.Record
+				if !discardOnly {
+					local = make([]sink.Record, 0, len(p.Records))
+				}
+				for _, r := range p.Records {
+					sentAt := readSentAt(r)
+					latency := time.Duration(0)
+					if !sentAt.IsZero() {
+						latency = now.Sub(sentAt)
+					}
+					rec.Inc(len(r.Key) + len(r.Value))
+					rec.Observe(latency)
+					if discardOnly {
+						continue
+					}
+					local = append(local, sink.Record{
+						Key: r.Key, Value: r.Value,
+						Topic: r.Topic, Partition: r.Partition, Offset: r.Offset,
+						SentAt: sentAt, RecvAt: now, Latency: latency,
+					})
+				}
+				if discardOnly || len(local) == 0 {
+					return
+				}
+				sinkMu.Lock()
+				buf = append(buf, local...)
+				full := len(buf) >= maxBatch
+				sinkMu.Unlock()
+				if full {
+					flush()
+				}
+			}(p)
 		})
+		pwg.Wait()
 
-		// Drain timer non-blockingly and flush on its tick.
 		select {
 		case <-flushTimer.C:
-			flush()
+			if !discardOnly {
+				flush()
+			}
 			flushTimer.Reset(flushEvery)
 		default:
 		}
 	}
 
-	flush()
-	slog.Info("done", "summary", rep.Tick("consume.final"))
+	if !discardOnly {
+		flush()
+	}
+	fmt.Print(rec.Summary("consumer"))
 	return nil
 }
 
@@ -164,8 +201,6 @@ func newClient(p *config.Profile) (*kgo.Client, error) {
 		kgo.ConsumeTopics(p.Topic),
 		kgo.ConsumerGroup(p.Consumer.GroupID),
 		kgo.ClientID("kafkaforge-consumer"),
-		kgo.DisableAutoCommit(),
-		kgo.AutoCommitMarks(),
 	}
 	if p.Consumer.FetchMinBytes > 0 {
 		opts = append(opts, kgo.FetchMinBytes(int32(p.Consumer.FetchMinBytes)))

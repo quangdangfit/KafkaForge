@@ -25,12 +25,19 @@ type Recorder struct {
 	failed atomic.Int64
 	bytes  atomic.Int64
 
+	started time.Time
+
 	mu   sync.Mutex
-	hist *hdr.Histogram
+	hist *hdr.Histogram // resets each Tick — used for the rolling window line
+	cum  *hdr.Histogram // never resets — used for the final summary
 }
 
 func New() *Recorder {
-	return &Recorder{hist: hdr.New(histMinValue, histMaxValue, histSigFigs)}
+	return &Recorder{
+		started: time.Now(),
+		hist:    hdr.New(histMinValue, histMaxValue, histSigFigs),
+		cum:     hdr.New(histMinValue, histMaxValue, histSigFigs),
+	}
 }
 
 func (r *Recorder) Inc(bytes int) {
@@ -49,6 +56,7 @@ func (r *Recorder) Observe(d time.Duration) {
 	}
 	r.mu.Lock()
 	_ = r.hist.RecordValue(int64(d))
+	_ = r.cum.RecordValue(int64(d))
 	r.mu.Unlock()
 }
 
@@ -115,5 +123,40 @@ func (rp *Reporter) Tick(label string) string {
 		s.Max.Round(time.Microsecond),
 		s.Count,
 		s.Failed,
+	)
+}
+
+// Summary returns a multi-line lifetime report covering the whole run: totals,
+// average rates, and percentiles drawn from the cumulative histogram.
+func (r *Recorder) Summary(label string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	elapsed := time.Since(r.started)
+	if elapsed <= 0 {
+		elapsed = time.Nanosecond
+	}
+	count := r.count.Load()
+	failed := r.failed.Load()
+	bytes := r.bytes.Load()
+	secs := elapsed.Seconds()
+
+	return fmt.Sprintf(
+		"\n=== %s summary ===\n"+
+			"  elapsed:  %s\n"+
+			"  total:    %d (failed: %d)\n"+
+			"  avg rps:  %.0f\n"+
+			"  avg mb/s: %.2f\n"+
+			"  latency:  p50=%s p95=%s p99=%s p99.9=%s max=%s\n",
+		label,
+		elapsed.Round(time.Millisecond),
+		count, failed,
+		float64(count)/secs,
+		float64(bytes)/secs/(1<<20),
+		time.Duration(r.cum.ValueAtQuantile(50)).Round(time.Microsecond),
+		time.Duration(r.cum.ValueAtQuantile(95)).Round(time.Microsecond),
+		time.Duration(r.cum.ValueAtQuantile(99)).Round(time.Microsecond),
+		time.Duration(r.cum.ValueAtQuantile(99.9)).Round(time.Microsecond),
+		time.Duration(r.cum.Max()).Round(time.Microsecond),
 	)
 }
