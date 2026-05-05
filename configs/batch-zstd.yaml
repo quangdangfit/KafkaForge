@@ -1,0 +1,20 @@
+# Aggressive batching with zstd: optimised for raw throughput / network-bound
+# scenarios. Higher linger trades latency for compression ratio.
+brokers: localhost:9092,localhost:9094,localhost:9095
+topic: notifications
+
+producer:
+  mode: async
+  acks: all
+  linger: 50ms
+  batch_max_bytes: 4194304   # 4 MiB
+  compression: zstd
+  max_buffered: 200000
+  idempotent: true
+
+consumer:
+  group_id: kafkaforge-batch-zstd
+  fetch_min_bytes: 524288     # 512 KiB
+  fetch_max_bytes: 33554432   # 32 MiB
+  fetch_max_wait: 100ms
+  sink: discard

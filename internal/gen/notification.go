@@ -66,10 +66,9 @@ func (g *Generator) Next() Notification {
 	}
 }
 
-// NextJSON returns the next Notification serialized as JSON, plus a key
+// Marshal serialises n to JSON and returns it together with a partitioning key
 // derived from UserID so messages for the same user land on the same partition.
-func (g *Generator) NextJSON() (key, value []byte, err error) {
-	n := g.Next()
+func (n Notification) Marshal() (key, value []byte, err error) {
 	v, err := json.Marshal(n)
 	if err != nil {
 		return nil, nil, fmt.Errorf("marshal notification: %w", err)

@@ -25,54 +25,67 @@ deploy/            # docker-compose for kafka + clickhouse
 configs/           # YAML/env profiles per tuning scenario
 ```
 
-## Roadmap (simple → advanced)
+## Status
 
-**P1 — Bootstrap**
-- `docker-compose` with 3 Kafka brokers in KRaft mode, ports 9092/9093/9094
-- Init script to create topic `notifications` (partitions=6, RF=3)
+| Phase | Scope | State |
+|-------|-------|-------|
+| P1 | 3-broker KRaft cluster + topic init | done |
+| P2 | Single-publish baseline + generator | done |
+| P3 | Consumer group with RPS report | done |
+| P4 | Batching (linger, compression, fetch tuning) via profiles | done |
+| P5 | HDR-histogram metrics: p50/p95/p99 end-to-end via `sent_at_ns` header | done |
+| P6 | ClickHouse sink (`kafkaforge.notifications_consumed`) | done |
+| P7 | YAML tuning profiles + matrix runner | done |
+| P8 | Chaos script (`scripts/chaos.sh`); Grafana dashboard not yet built | partial |
 
-**P2 — Basic publisher**
-- Generator producing fake push notifications (user_id, title, body, ts UTC)
-- Single publish, log messages/sec
+## Architecture
 
-**P3 — Basic consumer**
-- Consumer group, print RPS every second (sliding window)
+End-to-end latency is propagated via a record header `sent_at_ns` (big-endian
+int64 unix-nanos) set by the publisher and read by the consumer; this avoids
+JSON parsing on the hot path and works regardless of payload format.
 
-**P4 — Batching**
-- Publisher: batch + linger + compression (lz4/zstd)
-- Consumer: fetch in batches, measure throughput vs latency
+The producer mode is selected per profile (`single` vs `async`):
+- `single` forces `MaxBufferedRecords=1` + `ProduceSync` so each record is one
+  round-trip — the latency baseline.
+- `async` enables `Linger` + `BatchMaxBytes` + compression + buffered produce
+  with callbacks; this is what real workloads use.
 
-**P5 — Metrics**
-- `internal/metrics`: RPS, p50/p95/p99 end-to-end (publish ts → consume ts)
-- Print at interval
+`internal/metrics` wraps an HDR histogram (1ns–60s, 3 sig figs). The
+`Reporter` prints rolling RPS / MB-per-sec / p50/p95/p99 at a configurable
+interval; the histogram resets each tick so the percentiles describe the
+*latest* window rather than the full run.
 
-**P6 — ClickHouse sink**
-- Consumer writes messages + latency to ClickHouse (async insert / buffer table)
-- Sample queries for analysis
-
-**P7 — Tuning matrix**
-- YAML profiles: partitions, acks, batch.size, linger.ms, fetch.min.bytes, compression, ...
-- Runner that sweeps profiles and prints a comparison table
-
-**P8 — Advanced**
-- Multi-publisher / multi-consumer scale-out
-- Chaos: kill a broker, measure recovery
-- Dashboard (Grafana + ClickHouse or Prometheus)
+`internal/sink` is the consumer's downstream store. `Discard` is a no-op for
+pure throughput tests; `Clickhouse` ensures the schema and inserts via
+`PrepareBatch`. The consumer flushes when the buffer hits `sink_batch_size`
+or every `sink_flush_period`.
 
 ## Conventions
 
 - All code, comments, and docs in English
 - Every I/O function takes `context.Context` as the first argument
-- Log with `slog` (JSON handler when benchmarking)
+- Log with `slog` (JSON handler)
 - Timestamps are UTC, type `time.Time`
-- Config via env + flags (flags take precedence so benchmarks can override easily)
+- Bench-relevant config goes in `configs/*.yaml`; CLI flags only cover runtime
+  knobs (`--count`, `--rate`, `--report`) so two runs with the same profile
+  are directly comparable
 
-## Commands (filled in as code lands)
+## Commands
 
-- `make up` / `make down` — start/stop kafka + clickhouse
-- `make topic` — create topics
-- `go run ./cmd/publisher --profile=configs/p4-batch.yaml`
-- `go run ./cmd/consumer --profile=configs/p4-batch.yaml`
+```
+make up                        # bring up kafka cluster + clickhouse + UI
+make topic                     # create the notifications topic
+make publish PROFILE=configs/batch-lz4.yaml COUNT=200000
+make consume PROFILE=configs/batch-lz4.yaml
+make matrix                    # publisher sweep over configs/*.yaml
+make chaos                     # kill a random broker for DOWN_FOR seconds
+make build vet test            # Go checks
+make clean                     # down -v (drops volumes)
+```
+
+Profiles live in `configs/`: `baseline.yaml`, `batch-lz4.yaml`,
+`batch-zstd.yaml`, `clickhouse-sink.yaml`. Add a new YAML to extend the
+tuning matrix; `scripts/run-matrix.sh` picks them up by filename.
 
 ## Commit Convention
 

@@ -85,7 +85,25 @@ services:
       kafka-2: { condition: service_healthy }
       kafka-3: { condition: service_healthy }
 
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: kf-clickhouse
+    restart: unless-stopped
+    ports:
+      - "9000:9000"   # native protocol
+      - "8123:8123"   # http
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
 volumes:
   kafka-1-data:
   kafka-2-data:
   kafka-3-data:
+  clickhouse-data:

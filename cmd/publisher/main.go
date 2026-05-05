@@ -1,173 +1,259 @@
 // Publisher CLI: generates fake push notifications and publishes them to Kafka.
 //
-// In P2 the focus is correctness and a baseline RPS number, so each message is
-// produced synchronously (one round-trip per message). Batching, linger and
-// compression land in P4.
+// The producer config (single vs async, linger, compression, acks, ...) lives
+// in a YAML profile under configs/. The CLI flags are limited to runtime
+// concerns (--profile, --count, --rate, --report) so two runs with the same
+// profile are directly comparable.
 package main
 
 import (
 	"context"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 
+	"github.com/quangdangfit/kafkaforge/internal/config"
 	"github.com/quangdangfit/kafkaforge/internal/gen"
+	"github.com/quangdangfit/kafkaforge/internal/metrics"
 )
 
-type config struct {
-	brokers     string
-	topic       string
+const sentAtHeader = "sent_at_ns"
+
+type runFlags struct {
+	profilePath string
 	count       int64
-	rateLimit   int
+	rate        int
 	users       int64
-	reportEvery time.Duration
-	clientID    string
-	acks        string
+	report      time.Duration
 }
 
-func parseFlags() config {
-	var c config
-	flag.StringVar(&c.brokers, "brokers", "localhost:9092,localhost:9094,localhost:9095", "comma-separated bootstrap brokers")
-	flag.StringVar(&c.topic, "topic", "notifications", "topic to publish to")
-	flag.Int64Var(&c.count, "count", 0, "stop after N messages (0 = run until interrupted)")
-	flag.IntVar(&c.rateLimit, "rate", 0, "max messages per second (0 = unlimited)")
-	flag.Int64Var(&c.users, "users", 1_000_000, "size of the synthetic user space")
-	flag.DurationVar(&c.reportEvery, "report", time.Second, "interval between RPS log lines")
-	flag.StringVar(&c.clientID, "client-id", "kafkaforge-publisher", "Kafka client.id")
-	flag.StringVar(&c.acks, "acks", "all", "ack mode: all | leader | none")
+func parseFlags() runFlags {
+	var f runFlags
+	flag.StringVar(&f.profilePath, "profile", "configs/baseline.yaml", "path to YAML tuning profile")
+	flag.Int64Var(&f.count, "count", 0, "stop after N messages (0 = run until interrupted)")
+	flag.IntVar(&f.rate, "rate", 0, "max messages per second (0 = unlimited)")
+	flag.Int64Var(&f.users, "users", 1_000_000, "size of the synthetic user space")
+	flag.DurationVar(&f.report, "report", time.Second, "interval between metric log lines")
 	flag.Parse()
-	return c
-}
-
-func acksFromString(s string) (kgo.Acks, error) {
-	switch strings.ToLower(s) {
-	case "all", "-1":
-		return kgo.AllISRAcks(), nil
-	case "leader", "1":
-		return kgo.LeaderAck(), nil
-	case "none", "0":
-		return kgo.NoAck(), nil
-	default:
-		return kgo.Acks{}, fmt.Errorf("invalid acks %q (want all|leader|none)", s)
-	}
+	return f
 }
 
 func main() {
-	cfg := parseFlags()
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	slog.SetDefault(logger)
-
-	if err := run(cfg); err != nil {
-		logger.Error("publisher failed", "err", err)
+	flags := parseFlags()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	if err := run(flags); err != nil {
+		slog.Error("publisher failed", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(cfg config) error {
+func run(flags runFlags) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	acks, err := acksFromString(cfg.acks)
+	profile, err := config.Load(flags.profilePath)
 	if err != nil {
 		return err
 	}
 
-	cl, err := kgo.NewClient(
-		kgo.SeedBrokers(strings.Split(cfg.brokers, ",")...),
-		kgo.DefaultProduceTopic(cfg.topic),
-		kgo.ClientID(cfg.clientID),
-		kgo.RequiredAcks(acks),
-		// P2: keep batching disabled so each Produce is a real single round-trip.
-		// franz-go has no "disable batching" knob, but a 1-record max effectively
-		// flushes per message; combined with ProduceSync below we get single-shot
-		// publishing semantics.
-		kgo.MaxBufferedRecords(1),
-	)
+	cl, err := newClient(profile)
 	if err != nil {
-		return fmt.Errorf("kgo client: %w", err)
+		return err
 	}
 	defer cl.Close()
 
 	if err := cl.Ping(ctx); err != nil {
 		return fmt.Errorf("ping brokers: %w", err)
 	}
-	slog.Info("connected", "brokers", cfg.brokers, "topic", cfg.topic, "acks", cfg.acks)
+	slog.Info("connected",
+		"brokers", profile.Brokers,
+		"topic", profile.Topic,
+		"mode", profile.Producer.Mode,
+		"acks", profile.Producer.Acks,
+		"compression", profile.Producer.Compression,
+		"linger", profile.Producer.Linger.String(),
+	)
 
-	g := gen.NewGenerator(uint64(time.Now().UnixNano()), cfg.users)
+	rec := metrics.New()
+	rep := metrics.NewReporter(rec)
 
-	var sent, failed atomic.Int64
-	go reportLoop(ctx, cfg.reportEvery, &sent, &failed)
+	go func() {
+		t := time.NewTicker(flags.report)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				slog.Info(rep.Tick("publish"))
+			}
+		}
+	}()
+
+	g := gen.NewGenerator(uint64(time.Now().UnixNano()), flags.users)
 
 	var ticker *time.Ticker
-	if cfg.rateLimit > 0 {
-		ticker = time.NewTicker(time.Second / time.Duration(cfg.rateLimit))
+	if flags.rate > 0 {
+		ticker = time.NewTicker(time.Second / time.Duration(flags.rate))
 		defer ticker.Stop()
 	}
 
+	produce := chooseProducer(cl, profile, rec)
+
+	var wg sync.WaitGroup
+	produced := int64(0)
+loop:
 	for {
 		if ctx.Err() != nil {
 			break
 		}
-		if cfg.count > 0 && sent.Load()+failed.Load() >= cfg.count {
+		if flags.count > 0 && produced >= flags.count {
 			break
 		}
 		if ticker != nil {
 			select {
 			case <-ctx.Done():
-				break
+				break loop
 			case <-ticker.C:
 			}
 		}
 
-		key, val, err := g.NextJSON()
+		n := g.Next()
+		key, val, err := n.Marshal()
 		if err != nil {
 			return err
 		}
-		rec := &kgo.Record{Key: key, Value: val}
+		hdr := []kgo.RecordHeader{{Key: sentAtHeader, Value: nanosToBytes(n.SentAt.UnixNano())}}
+		r := &kgo.Record{Topic: profile.Topic, Key: key, Value: val, Headers: hdr}
 
-		// ProduceSync = the single-publish baseline for P2.
-		if r := cl.ProduceSync(ctx, rec).FirstErr(); r != nil {
-			failed.Add(1)
-			slog.Warn("produce failed", "err", r)
-			continue
-		}
-		sent.Add(1)
+		produce(ctx, r, &wg)
+		produced++
 	}
 
-	slog.Info("shutting down", "sent", sent.Load(), "failed", failed.Load())
-	return cl.Flush(context.Background())
+	wg.Wait()
+	if err := cl.Flush(context.Background()); err != nil {
+		slog.Warn("flush", "err", err)
+	}
+	slog.Info("done", "summary", rep.Tick("publish.final"))
+	return nil
 }
 
-func reportLoop(ctx context.Context, every time.Duration, sent, failed *atomic.Int64) {
-	t := time.NewTicker(every)
-	defer t.Stop()
-
-	var lastSent, lastFailed int64
-	last := time.Now()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case now := <-t.C:
-			s, f := sent.Load(), failed.Load()
-			elapsed := now.Sub(last).Seconds()
-			rps := float64(s-lastSent) / elapsed
-			fps := float64(f-lastFailed) / elapsed
-			slog.Info("rps",
-				"sent_total", s,
-				"failed_total", f,
-				"sent_per_sec", fmt.Sprintf("%.1f", rps),
-				"failed_per_sec", fmt.Sprintf("%.1f", fps),
-			)
-			lastSent, lastFailed, last = s, f, now
+// chooseProducer returns either a synchronous (one round-trip per record) or
+// asynchronous (callback-driven, batching) produce function based on profile.
+func chooseProducer(cl *kgo.Client, p *config.Profile, rec *metrics.Recorder) func(context.Context, *kgo.Record, *sync.WaitGroup) {
+	switch strings.ToLower(p.Producer.Mode) {
+	case "single":
+		return func(ctx context.Context, r *kgo.Record, _ *sync.WaitGroup) {
+			start := time.Now()
+			if err := cl.ProduceSync(ctx, r).FirstErr(); err != nil {
+				rec.Fail()
+				return
+			}
+			rec.Observe(time.Since(start))
+			rec.Inc(len(r.Key) + len(r.Value))
+		}
+	default:
+		return func(ctx context.Context, r *kgo.Record, wg *sync.WaitGroup) {
+			wg.Add(1)
+			start := time.Now()
+			cl.Produce(ctx, r, func(rr *kgo.Record, err error) {
+				defer wg.Done()
+				if err != nil {
+					rec.Fail()
+					return
+				}
+				rec.Observe(time.Since(start))
+				rec.Inc(len(rr.Key) + len(rr.Value))
+			})
 		}
 	}
+}
+
+func newClient(p *config.Profile) (*kgo.Client, error) {
+	acks, err := acksFromString(p.Producer.Acks)
+	if err != nil {
+		return nil, err
+	}
+	codec, err := compressionFromString(p.Producer.Compression)
+	if err != nil {
+		return nil, err
+	}
+
+	opts := []kgo.Opt{
+		kgo.SeedBrokers(strings.Split(p.Brokers, ",")...),
+		kgo.DefaultProduceTopic(p.Topic),
+		kgo.ClientID("kafkaforge-publisher"),
+		kgo.RequiredAcks(acks),
+		kgo.ProducerBatchCompression(codec...),
+	}
+
+	if strings.ToLower(p.Producer.Mode) == "single" {
+		// Force one record per batch so each Produce really is a round-trip.
+		opts = append(opts, kgo.MaxBufferedRecords(1))
+	} else {
+		if p.Producer.Linger > 0 {
+			opts = append(opts, kgo.ProducerLinger(p.Producer.Linger))
+		}
+		if p.Producer.BatchMaxBytes > 0 {
+			opts = append(opts, kgo.ProducerBatchMaxBytes(int32(p.Producer.BatchMaxBytes)))
+		}
+		if p.Producer.MaxBuffered > 0 {
+			opts = append(opts, kgo.MaxBufferedRecords(p.Producer.MaxBuffered))
+		}
+	}
+
+	if !p.Producer.Idempotent {
+		// franz-go enables idempotency by default; turning it off lets us
+		// benchmark acks=0/1 paths cleanly.
+		if acks != kgo.AllISRAcks() {
+			opts = append(opts, kgo.DisableIdempotentWrite())
+		}
+	}
+
+	return kgo.NewClient(opts...)
+}
+
+func acksFromString(s string) (kgo.Acks, error) {
+	switch strings.ToLower(s) {
+	case "all", "-1", "":
+		return kgo.AllISRAcks(), nil
+	case "leader", "1":
+		return kgo.LeaderAck(), nil
+	case "none", "0":
+		return kgo.NoAck(), nil
+	default:
+		return kgo.Acks{}, fmt.Errorf("invalid acks %q", s)
+	}
+}
+
+func compressionFromString(s string) ([]kgo.CompressionCodec, error) {
+	switch strings.ToLower(s) {
+	case "", "none":
+		return []kgo.CompressionCodec{kgo.NoCompression()}, nil
+	case "lz4":
+		return []kgo.CompressionCodec{kgo.Lz4Compression()}, nil
+	case "zstd":
+		return []kgo.CompressionCodec{kgo.ZstdCompression()}, nil
+	case "snappy":
+		return []kgo.CompressionCodec{kgo.SnappyCompression()}, nil
+	case "gzip":
+		return []kgo.CompressionCodec{kgo.GzipCompression()}, nil
+	default:
+		return nil, fmt.Errorf("invalid compression %q", s)
+	}
+}
+
+func nanosToBytes(ns int64) []byte {
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, uint64(ns))
+	return b
 }

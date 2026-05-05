@@ -1,0 +1,20 @@
+# Async batched producer with LZ4 compression. Good throughput/latency tradeoff
+# and the typical "production default" to beat.
+brokers: localhost:9092,localhost:9094,localhost:9095
+topic: notifications
+
+producer:
+  mode: async
+  acks: all
+  linger: 10ms
+  batch_max_bytes: 1048576   # 1 MiB
+  compression: lz4
+  max_buffered: 100000
+  idempotent: true
+
+consumer:
+  group_id: kafkaforge-batch-lz4
+  fetch_min_bytes: 65536      # 64 KiB
+  fetch_max_bytes: 10485760   # 10 MiB
+  fetch_max_wait: 50ms
+  sink: discard

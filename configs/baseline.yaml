@@ -1,0 +1,16 @@
+# Single-publish baseline: one synchronous round-trip per record.
+# Useful as the slow-but-correct reference number for P4 batching to beat.
+brokers: localhost:9092,localhost:9094,localhost:9095
+topic: notifications
+
+producer:
+  mode: single
+  acks: all
+  compression: none
+  idempotent: true
+
+consumer:
+  group_id: kafkaforge-baseline
+  fetch_min_bytes: 1
+  fetch_max_wait: 100ms
+  sink: discard
